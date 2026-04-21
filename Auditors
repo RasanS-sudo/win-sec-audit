@@ -1,0 +1,1135 @@
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace WinSecAudit;
+
+public static class PasswordPolicyAuditor
+{
+    // P/Invoke: NetUserModalsGet level 0 = password policy
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int NetUserModalsGet(
+        string? server,
+        int level,
+        out IntPtr bufPtr
+    );
+
+    [DllImport("netapi32.dll")]
+    private static extern int NetApiBufferFree(IntPtr buffer);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct USER_MODALS_INFO_0
+    {
+        public uint usrmod0_min_passwd_len;
+        public uint usrmod0_max_passwd_age;
+        public uint usrmod0_min_passwd_age;
+        public uint usrmod0_password_hist_len;
+        public uint usrmod0_force_logoff;
+    }
+
+    // Level 3 = lockout policy
+    [StructLayout(LayoutKind.Sequential)]
+    private struct USER_MODALS_INFO_3
+    {
+        public uint usrmod3_lockout_duration;
+        public uint usrmod3_lockout_observation_window;
+        public uint usrmod3_lockout_threshold;
+    }
+
+    private const uint TIMEQ_FOREVER = 0xFFFFFFFF;
+    private const int  NERR_Success  = 0;
+
+    public static List<Finding> Audit()
+    {
+        var findings = new List<Finding>();
+
+        // --- Password Policy (Level 0) ---
+        int ret = NetUserModalsGet(null, 0, out IntPtr buf0);
+        if (ret == NERR_Success && buf0 != IntPtr.Zero)
+        {
+            try
+            {
+                var info = Marshal.PtrToStructure<USER_MODALS_INFO_0>(buf0);
+
+                // Minimum password length
+                uint minLen = info.usrmod0_min_passwd_len;
+                findings.Add(new Finding(
+                    "Password Policy",
+                    "Minimum Password Length",
+                    $"Minimum password length is {minLen} characters.",
+                    minLen >= 14 ? Severity.Pass : minLen >= 8 ? Severity.Medium : Severity.High,
+                    $"Current value: {minLen}. Recommended: ≥14 (NIST SP 800-63B, CMMC AC.1.001).",
+                    minLen >= 14
+                        ? "Compliant."
+                        : "Set minimum password length to 14+ via: Computer Configuration → Windows Settings → Security Settings → Account Policies → Password Policy."
+                ));
+
+                // Password history
+                uint histLen = info.usrmod0_password_hist_len;
+                findings.Add(new Finding(
+                    "Password Policy",
+                    "Password History",
+                    $"Password history remembers {histLen} previous passwords.",
+                    histLen >= 24 ? Severity.Pass : histLen >= 5 ? Severity.Low : Severity.Medium,
+                    $"Current value: {histLen}. Recommended: ≥24 (CIS Benchmark).",
+                    histLen >= 24
+                        ? "Compliant."
+                        : "Increase password history to 24 via Group Policy: Account Policies → Password Policy → Enforce password history."
+                ));
+
+                // Max password age
+                uint maxAge = info.usrmod0_max_passwd_age;
+                bool neverExpires = maxAge == TIMEQ_FOREVER;
+                uint maxAgeDays = neverExpires ? 0 : maxAge / 86400;
+                findings.Add(new Finding(
+                    "Password Policy",
+                    "Maximum Password Age",
+                    neverExpires
+                        ? "Passwords are set to never expire."
+                        : $"Passwords expire every {maxAgeDays} days.",
+                    neverExpires ? Severity.High : maxAgeDays <= 90 ? Severity.Pass : Severity.Medium,
+                    neverExpires
+                        ? "Passwords never expire — users may retain compromised credentials indefinitely."
+                        : $"Current value: {maxAgeDays} days.",
+                    neverExpires
+                        ? "Set maximum password age to 60–90 days via Group Policy: Account Policies → Password Policy → Maximum password age."
+                        : maxAgeDays <= 90 ? "Compliant." : "Reduce maximum password age to 90 days or fewer."
+                ));
+            }
+            finally
+            {
+                NetApiBufferFree(buf0);
+            }
+        }
+        else
+        {
+            findings.Add(new Finding(
+                "Password Policy",
+                "Policy Read",
+                "Unable to read password policy — may require elevation.",
+                Severity.Info,
+                $"NetUserModalsGet returned error code {ret}.",
+                "Re-run as Administrator for full password policy audit."
+            ));
+        }
+
+        // --- Lockout Policy (Level 3) ---
+        int ret3 = NetUserModalsGet(null, 3, out IntPtr buf3);
+        if (ret3 == NERR_Success && buf3 != IntPtr.Zero)
+        {
+            try
+            {
+                var info = Marshal.PtrToStructure<USER_MODALS_INFO_3>(buf3);
+
+                uint threshold = info.usrmod3_lockout_threshold;
+                findings.Add(new Finding(
+                    "Account Lockout",
+                    "Lockout Threshold",
+                    $"Account locks after {(threshold == 0 ? "unlimited (never)" : threshold.ToString())} failed attempts.",
+                    threshold == 0 ? Severity.High : threshold <= 5 ? Severity.Pass : Severity.Medium,
+                    $"Current threshold: {threshold}. Recommended: 3–5 attempts (CMMC AC.2.006).",
+                    threshold == 0
+                        ? "Enable account lockout: Group Policy → Account Policies → Account Lockout Policy → Account lockout threshold → set to 5."
+                        : threshold <= 5 ? "Compliant." : "Reduce lockout threshold to 5 or fewer failed attempts."
+                ));
+
+                uint durationSec = info.usrmod3_lockout_duration;
+                uint durationMin = durationSec / 60;
+                findings.Add(new Finding(
+                    "Account Lockout",
+                    "Lockout Duration",
+                    $"Locked accounts unlock after {durationMin} minutes.",
+                    durationMin >= 15 ? Severity.Pass : Severity.Low,
+                    $"Current value: {durationMin} minutes. Recommended: ≥15 minutes.",
+                    durationMin >= 15
+                        ? "Compliant."
+                        : "Set lockout duration to 15+ minutes: Group Policy → Account Lockout Policy → Account lockout duration."
+                ));
+            }
+            finally
+            {
+                NetApiBufferFree(buf3);
+            }
+        }
+
+        return findings;
+    }
+}
+
+using Microsoft.Win32;
+
+namespace WinSecAudit;
+
+public static class PatchAuditor
+{
+    public static List<Finding> Audit()
+    {
+        var findings = new List<Finding>();
+
+        findings.AddRange(CheckWindowsUpdateSettings());
+        findings.AddRange(CheckLastUpdateTime());
+        findings.AddRange(CheckDefenderStatus());
+
+        return findings;
+    }
+
+    private static IEnumerable<Finding> CheckWindowsUpdateSettings()
+    {
+        // Windows Update configuration stored in registry
+        // AUOptions: 1=Notify, 2=Auto download, 3=Auto download+notify install, 4=Auto install
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU");
+
+            if (key != null)
+            {
+                object? noAutoUpdate = key.GetValue("NoAutoUpdate");
+                object? auOptions    = key.GetValue("AUOptions");
+
+                bool autoUpdateDisabled = noAutoUpdate is int n && n == 1;
+                int  auOption           = auOptions is int a ? a : 4;
+
+                yield return new Finding(
+                    "Patch Management",
+                    "Automatic Windows Updates",
+                    autoUpdateDisabled
+                        ? "Automatic Windows Updates are DISABLED via Group Policy."
+                        : $"Windows Update AUOptions: {auOption} ({DescribeAUOption(auOption)}).",
+                    autoUpdateDisabled ? Severity.High : auOption >= 3 ? Severity.Pass : Severity.Medium,
+                    autoUpdateDisabled
+                        ? "NoAutoUpdate = 1 in HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU"
+                        : $"AUOptions = {auOption}",
+                    autoUpdateDisabled
+                        ? "Re-enable automatic updates via Group Policy: Computer Configuration → Administrative Templates → Windows Components → Windows Update → Configure Automatic Updates."
+                        : auOption >= 3
+                        ? "Compliant. Automatic download and installation is configured."
+                        : "Set AUOptions to 4 (Auto download and schedule install) for full automation."
+                );
+            }
+            else
+            {
+                // No policy key — check direct WU settings
+                using var wuKey = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update");
+
+                if (wuKey != null)
+                {
+                    object? auVal = wuKey.GetValue("AUOptions");
+                    int auOption  = auVal is int a ? a : 0;
+
+                    yield return new Finding(
+                        "Patch Management",
+                        "Automatic Windows Updates",
+                        $"Windows Update configured with AUOptions = {auOption} ({DescribeAUOption(auOption)}).",
+                        auOption >= 3 ? Severity.Pass : Severity.Medium,
+                        $"Registry: AUOptions = {auOption}. No Group Policy override detected.",
+                        auOption >= 3
+                            ? "Compliant."
+                            : "Configure automatic updates: Settings → Windows Update → Advanced options → enable automatic updates."
+                    );
+                }
+                else
+                {
+                    yield return new Finding(
+                        "Patch Management",
+                        "Automatic Windows Updates",
+                        "Windows Update configuration could not be read — default settings may apply.",
+                        Severity.Info,
+                        "No registry key found at expected update policy paths.",
+                        "Verify Windows Update is configured via: Settings → Windows Update → Advanced options."
+                    );
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            yield return new Finding(
+                "Patch Management",
+                "Windows Update Configuration",
+                "Unable to read Windows Update registry configuration.",
+                Severity.Info,
+                ex.Message,
+                "Manually verify: Settings → Windows Update → Advanced options."
+            );
+        }
+    }
+
+    private static IEnumerable<Finding> CheckLastUpdateTime()
+    {
+        // Last successful update installation time
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install");
+
+            if (key != null)
+            {
+                object? lastSuccessTime = key.GetValue("LastSuccessTime");
+                if (lastSuccessTime is string dateStr &&
+                    DateTime.TryParse(dateStr, out DateTime lastUpdate))
+                {
+                    TimeSpan age = DateTime.UtcNow - lastUpdate;
+                    int daysSince = (int)age.TotalDays;
+
+                    yield return new Finding(
+                        "Patch Management",
+                        "Last Successful Update",
+                        $"Last successful Windows Update: {lastUpdate:yyyy-MM-dd} ({daysSince} days ago).",
+                        daysSince <= 30  ? Severity.Pass
+                        : daysSince <= 60 ? Severity.Medium
+                        : Severity.High,
+                        $"Last update: {lastUpdate:yyyy-MM-dd HH:mm} UTC. Days since: {daysSince}.",
+                        daysSince <= 30
+                            ? "Compliant. Patch cadence is within acceptable window."
+                            : daysSince <= 60
+                            ? "Patch cadence is lagging. Run Windows Update now: Settings → Windows Update → Check for updates."
+                            : $"System has not received updates in {daysSince} days. Immediate patching required. Run Windows Update or contact IT."
+                    );
+                }
+            }
+            else
+            {
+                yield return new Finding(
+                    "Patch Management",
+                    "Last Successful Update",
+                    "Unable to determine last update installation time.",
+                    Severity.Info,
+                    "Registry key not found or inaccessible.",
+                    "Check Windows Update history: Settings → Windows Update → Update history."
+                );
+            }
+        }
+        catch { /* Silently skip if registry path unavailable */ }
+    }
+
+    private static IEnumerable<Finding> CheckDefenderStatus()
+    {
+        // Windows Defender status via registry
+        // Real-time protection, definition age, tamper protection
+        try
+        {
+            using var defKey = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows Defender\Real-Time Protection");
+
+            if (defKey != null)
+            {
+                object? rtpDisabled = defKey.GetValue("DisableRealtimeMonitoring");
+                bool isDisabled = rtpDisabled is int i && i == 1;
+
+                yield return new Finding(
+                    "Endpoint Protection",
+                    "Windows Defender Real-Time Protection",
+                    isDisabled
+                        ? "Windows Defender Real-Time Protection is DISABLED."
+                        : "Windows Defender Real-Time Protection is enabled.",
+                    isDisabled ? Severity.Critical : Severity.Pass,
+                    isDisabled
+                        ? "DisableRealtimeMonitoring = 1 in registry."
+                        : "Real-time protection active.",
+                    isDisabled
+                        ? "Enable real-time protection: Windows Security → Virus & threat protection → Real-time protection → On.\nIf third-party AV is installed, ensure it's active and properly licensed."
+                        : "Compliant."
+                );
+            }
+
+            // Check signature age
+            using var sigKey = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows Defender\Signature Updates");
+
+            if (sigKey != null)
+            {
+                object? sigDate = sigKey.GetValue("SignaturesLastUpdated");
+                if (sigDate is byte[] bytes && bytes.Length == 8)
+                {
+                    long fileTime = BitConverter.ToInt64(bytes, 0);
+                    DateTime sigDateTime = DateTime.FromFileTimeUtc(fileTime);
+                    int daysSig = (int)(DateTime.UtcNow - sigDateTime).TotalDays;
+
+                    yield return new Finding(
+                        "Endpoint Protection",
+                        "Defender Signature Age",
+                        $"Antivirus signatures last updated {daysSig} day(s) ago ({sigDateTime:yyyy-MM-dd}).",
+                        daysSig <= 1  ? Severity.Pass
+                        : daysSig <= 7 ? Severity.Low
+                        : Severity.High,
+                        $"Signature date: {sigDateTime:yyyy-MM-dd HH:mm} UTC.",
+                        daysSig <= 7
+                            ? daysSig <= 1 ? "Compliant." : "Update signatures soon: Windows Security → Virus & threat protection → Check for updates."
+                            : $"Signatures are {daysSig} days old. Update immediately — stale signatures leave the endpoint vulnerable to known malware."
+                    );
+                }
+            }
+        }
+        catch
+        {
+            yield return new Finding(
+                "Endpoint Protection",
+                "Defender Status",
+                "Unable to read Windows Defender status from registry.",
+                Severity.Info,
+                "Registry access denied or Defender not present.",
+                "Verify endpoint protection status: Windows Security → Virus & threat protection."
+            );
+        }
+    }
+
+    private static string DescribeAUOption(int option) => option switch
+    {
+        1 => "Notify before download",
+        2 => "Auto download, notify install",
+        3 => "Auto download, schedule install",
+        4 => "Auto download and install",
+        _ => "Unknown/Default"
+    };
+}
+
+using System.Runtime.InteropServices;
+
+namespace WinSecAudit;
+
+public static class PrivilegedGroupAuditor
+{
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int NetLocalGroupGetMembers(
+        string? servername,
+        string localgroupname,
+        int level,
+        out IntPtr bufptr,
+        int prefmaxlen,
+        out int entriesread,
+        out int totalentries,
+        ref IntPtr resumehandle
+    );
+
+    [DllImport("netapi32.dll")]
+    private static extern int NetApiBufferFree(IntPtr buffer);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct LOCALGROUP_MEMBERS_INFO_3
+    {
+        public string lgrmi3_domainandname;
+    }
+
+    private const int NERR_Success    = 0;
+    private const int MAX_PREFERRED    = -1;
+
+    private static readonly string[] HighPrivilegeGroups = new[]
+    {
+        "Administrators",
+        "Remote Desktop Users",
+        "Backup Operators",
+        "Power Users",
+        "Remote Management Users"
+    };
+
+    public static List<Finding> Audit()
+    {
+        var findings = new List<Finding>();
+
+        foreach (var group in HighPrivilegeGroups)
+        {
+            IntPtr resumeHandle = IntPtr.Zero;
+            int ret = NetLocalGroupGetMembers(
+                null, group, 3,
+                out IntPtr buf,
+                MAX_PREFERRED,
+                out int entriesRead,
+                out int totalEntries,
+                ref resumeHandle
+            );
+
+            if (ret == NERR_Success && buf != IntPtr.Zero)
+            {
+                try
+                {
+                    var members = new List<string>();
+                    int structSize = Marshal.SizeOf<LOCALGROUP_MEMBERS_INFO_3>();
+
+                    for (int i = 0; i < entriesRead; i++)
+                    {
+                        IntPtr ptr = IntPtr.Add(buf, i * structSize);
+                        var info = Marshal.PtrToStructure<LOCALGROUP_MEMBERS_INFO_3>(ptr);
+                        if (!string.IsNullOrWhiteSpace(info.lgrmi3_domainandname))
+                            members.Add(info.lgrmi3_domainandname);
+                    }
+
+                    bool isAdmins  = group == "Administrators";
+                    bool tooMany   = isAdmins && members.Count > 2;
+                    bool hasGuest  = members.Any(m => m.EndsWith("Guest", StringComparison.OrdinalIgnoreCase));
+
+                    Severity sev = hasGuest ? Severity.Critical
+                                 : tooMany  ? Severity.Medium
+                                 : members.Count == 0 ? Severity.Info
+                                 : Severity.Pass;
+
+                    string memberList = members.Count > 0
+                        ? string.Join(", ", members)
+                        : "(empty)";
+
+                    string description = $"Group '{group}' has {members.Count} member(s): {memberList}";
+
+                    string remediation = hasGuest
+                        ? $"IMMEDIATE: Remove Guest/anonymous accounts from '{group}'. Open lusrmgr.msc → Groups → {group} → Properties → Remove."
+                        : tooMany
+                        ? $"Review and reduce Administrator membership. Principle of least privilege: only dedicated admin accounts should belong to this group."
+                        : members.Count == 0 ? "Group is empty — verify this is expected."
+                        : "Compliant. Periodically review membership for stale or unnecessary accounts.";
+
+                    findings.Add(new Finding(
+                        "Privileged Access",
+                        $"Group Membership: {group}",
+                        description,
+                        sev,
+                        $"Members ({members.Count}): {memberList}",
+                        remediation
+                    ));
+                }
+                finally
+                {
+                    NetApiBufferFree(buf);
+                }
+            }
+            else if (ret == 1376) // ERROR_NO_SUCH_ALIAS — group doesn't exist on this system
+            {
+                findings.Add(new Finding(
+                    "Privileged Access",
+                    $"Group Membership: {group}",
+                    $"Group '{group}' does not exist on this system.",
+                    Severity.Info,
+                    "Group not present — may be a workgroup machine or the group was renamed.",
+                    "Verify group naming conventions match your organization's baseline."
+                ));
+            }
+            else
+            {
+                findings.Add(new Finding(
+                    "Privileged Access",
+                    $"Group Membership: {group}",
+                    $"Could not enumerate '{group}' — error {ret}. May require elevation.",
+                    Severity.Info,
+                    $"NetLocalGroupGetMembers returned {ret}.",
+                    "Re-run as Administrator for complete group membership audit."
+                ));
+            }
+        }
+
+        return findings;
+    }
+}
+
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
+
+namespace WinSecAudit;
+
+public static class ServicesAuditor
+{
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenSCManager(string? machineName, string? databaseName, uint dwAccess);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool CloseServiceHandle(IntPtr hSCObject);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool EnumServicesStatusEx(
+        IntPtr hSCManager,
+        int infoLevel,
+        uint dwServiceType,
+        uint dwServiceState,
+        IntPtr lpServices,
+        uint cbBufSize,
+        out uint pcbBytesNeeded,
+        out uint lpServicesReturned,
+        ref uint lpResumeHandle,
+        string? pszGroupName
+    );
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ENUM_SERVICE_STATUS_PROCESS
+    {
+        public string lpServiceName;
+        public string lpDisplayName;
+        public SERVICE_STATUS_PROCESS ServiceStatusProcess;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SERVICE_STATUS_PROCESS
+    {
+        public uint dwServiceType;
+        public uint dwCurrentState;
+        public uint dwControlsAccepted;
+        public uint dwWin32ExitCode;
+        public uint dwServiceSpecificExitCode;
+        public uint dwCheckPoint;
+        public uint dwWaitHint;
+        public uint dwProcessId;
+        public uint dwServiceFlags;
+    }
+
+    private const uint SC_MANAGER_ENUMERATE_SERVICE = 0x0004;
+    private const uint SERVICE_WIN32                = 0x00000030;
+    private const uint SERVICE_ACTIVE               = 0x00000001;
+    private const int  SC_ENUM_PROCESS_INFO         = 0;
+
+    // Known dangerous services or services that should not run on workstations
+    private static readonly HashSet<string> HighRiskServices = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "RemoteRegistry",   // Remote registry access
+        "TlntSvr",          // Telnet Server
+        "FTPSVC",           // IIS FTP
+        "W3SVC",            // IIS (unexpected on workstations)
+        "SNMP",             // SNMP - cleartext community strings
+        "SNMPTrap",
+        "WMPNetworkSvc",    // Windows Media Player network sharing
+    };
+
+    // Service accounts that are considered privileged/risky
+    private static readonly HashSet<string> SystemAccounts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "LocalSystem",
+        "NT AUTHORITY\\SYSTEM",
+        "NT AUTHORITY\\LocalService",
+        "NT AUTHORITY\\NetworkService"
+    };
+
+    public static List<Finding> Audit()
+    {
+        var findings = new List<Finding>();
+
+        findings.AddRange(AuditRunningServices());
+        findings.AddRange(AuditScheduledTasks());
+        findings.AddRange(AuditAutoRunRegistry());
+
+        return findings;
+    }
+
+    private static IEnumerable<Finding> AuditRunningServices()
+    {
+        IntPtr scmHandle = OpenSCManager(null, null, SC_MANAGER_ENUMERATE_SERVICE);
+        if (scmHandle == IntPtr.Zero)
+        {
+            yield return new Finding(
+                "Services",
+                "Service Enumeration",
+                "Unable to open Service Control Manager — elevation required.",
+                Severity.Info,
+                $"Win32 error: {Marshal.GetLastWin32Error()}",
+                "Re-run as Administrator for full service audit."
+            );
+            yield break;
+        }
+
+        try
+        {
+            uint resume = 0;
+            uint bytesNeeded = 0;
+            uint servicesReturned = 0;
+
+            // First call to get required buffer size
+            EnumServicesStatusEx(scmHandle, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE,
+                IntPtr.Zero, 0, out bytesNeeded, out servicesReturned, ref resume, null);
+
+            if (bytesNeeded == 0) yield break;
+
+            IntPtr buf = Marshal.AllocHGlobal((int)bytesNeeded);
+            try
+            {
+                resume = 0;
+                bool success = EnumServicesStatusEx(scmHandle, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE,
+                    buf, bytesNeeded, out _, out servicesReturned, ref resume, null);
+
+                if (!success) yield break;
+
+                int structSize = Marshal.SizeOf<ENUM_SERVICE_STATUS_PROCESS>();
+                var riskyFound = new List<string>();
+                int totalRunning = (int)servicesReturned;
+
+                for (int i = 0; i < servicesReturned; i++)
+                {
+                    IntPtr ptr = IntPtr.Add(buf, i * structSize);
+                    var svc = Marshal.PtrToStructure<ENUM_SERVICE_STATUS_PROCESS>(ptr);
+
+                    if (HighRiskServices.Contains(svc.lpServiceName))
+                    {
+                        riskyFound.Add($"{svc.lpDisplayName} ({svc.lpServiceName})");
+
+                        bool isCritical = svc.lpServiceName.Equals("TlntSvr", StringComparison.OrdinalIgnoreCase)
+                                       || svc.lpServiceName.Equals("RemoteRegistry", StringComparison.OrdinalIgnoreCase);
+
+                        string remediation = svc.lpServiceName switch
+                        {
+                            "RemoteRegistry" => "Disable Remote Registry: services.msc → Remote Registry → Stop → Startup Type: Disabled.",
+                            "TlntSvr"        => "Disable Telnet Server immediately — it transmits credentials in cleartext.",
+                            "SNMP"           => "Disable SNMP or upgrade to SNMPv3 with authentication and encryption.",
+                            "FTPSVC"         => "Disable IIS FTP. Use SFTP via OpenSSH for secure file transfer.",
+                            _                => $"Evaluate whether '{svc.lpDisplayName}' is required. Disable via services.msc if not needed."
+                        };
+
+                        yield return new Finding(
+                            "Services",
+                            $"High-Risk Service Running: {svc.lpServiceName}",
+                            $"'{svc.lpDisplayName}' is actively running and represents a security risk.",
+                            isCritical ? Severity.High : Severity.Medium,
+                            $"Service: {svc.lpDisplayName} | Name: {svc.lpServiceName} | PID: {svc.ServiceStatusProcess.dwProcessId}",
+                            remediation
+                        );
+                    }
+                }
+
+                // Summary finding
+                yield return new Finding(
+                    "Services",
+                    "Running Services Count",
+                    $"{totalRunning} active Windows services found. {riskyFound.Count} flagged as high-risk.",
+                    riskyFound.Count > 0 ? Severity.Info : Severity.Pass,
+                    $"Total running: {totalRunning}. High-risk: {riskyFound.Count}",
+                    riskyFound.Count == 0
+                        ? "No high-risk services detected. Continue periodic review."
+                        : "Review and disable flagged services above if not required for business operations."
+                );
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+        finally
+        {
+            CloseServiceHandle(scmHandle);
+        }
+    }
+
+    private static IEnumerable<Finding> AuditScheduledTasks()
+    {
+        // Check for scheduled tasks running as SYSTEM from non-standard paths
+        // Use schtasks.exe output parsing — avoids COM dependency
+        var suspiciousTasks = new List<string>();
+
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "schtasks",
+                Arguments = "/query /fo CSV /v",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) yield break;
+
+            string output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+
+            // Parse CSV output
+            var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length < 2) yield break;
+
+            string[] headers = ParseCsvLine(lines[0]);
+            int nameIdx    = Array.FindIndex(headers, h => h.Contains("Task Name"));
+            int userIdx    = Array.FindIndex(headers, h => h.Contains("Run As User"));
+            int statusIdx  = Array.FindIndex(headers, h => h.Contains("Status"));
+            int taskToRun  = Array.FindIndex(headers, h => h.Contains("Task To Run"));
+
+            if (nameIdx < 0 || userIdx < 0) yield break;
+
+            int systemTaskCount = 0;
+            int suspiciousCount = 0;
+
+            for (int i = 1; i < lines.Length; i++)
+            {
+                string[] cols = ParseCsvLine(lines[i]);
+                if (cols.Length <= Math.Max(nameIdx, userIdx)) continue;
+
+                string taskName = cols[nameIdx];
+                string runAsUser = userIdx < cols.Length ? cols[userIdx] : "";
+                string taskAction = taskToRun >= 0 && taskToRun < cols.Length ? cols[taskToRun] : "";
+
+                bool runsAsSystem = runAsUser.Contains("SYSTEM", StringComparison.OrdinalIgnoreCase);
+                bool isMicrosoftTask = taskName.Contains("\\Microsoft\\", StringComparison.OrdinalIgnoreCase);
+
+                // Flag non-Microsoft SYSTEM tasks with suspicious paths
+                bool suspiciousPath = !isMicrosoftTask && runsAsSystem &&
+                    (taskAction.Contains("\\Temp\\", StringComparison.OrdinalIgnoreCase) ||
+                     taskAction.Contains("\\AppData\\", StringComparison.OrdinalIgnoreCase) ||
+                     taskAction.Contains("\\Public\\", StringComparison.OrdinalIgnoreCase) ||
+                     taskAction.Contains("powershell -e", StringComparison.OrdinalIgnoreCase) ||
+                     taskAction.Contains("cmd /c", StringComparison.OrdinalIgnoreCase));
+
+                if (runsAsSystem && !isMicrosoftTask) systemTaskCount++;
+                if (suspiciousPath)
+                {
+                    suspiciousCount++;
+                    suspiciousTasks.Add($"{taskName} → {taskAction}");
+                    yield return new Finding(
+                        "Scheduled Tasks",
+                        $"Suspicious Scheduled Task: {taskName}",
+                        $"Non-Microsoft task running as SYSTEM from a suspicious path: {taskAction}",
+                        Severity.High,
+                        $"Task: {taskName} | User: {runAsUser} | Action: {taskAction}",
+                        "Investigate immediately. Open Task Scheduler → find task → Disable or Delete if unauthorized. Suspicious SYSTEM tasks are a common persistence mechanism."
+                    );
+                }
+            }
+
+            yield return new Finding(
+                "Scheduled Tasks",
+                "Non-Microsoft SYSTEM Tasks",
+                $"{systemTaskCount} non-Microsoft scheduled task(s) running as SYSTEM. {suspiciousCount} flagged as suspicious.",
+                suspiciousCount > 0 ? Severity.High : systemTaskCount > 5 ? Severity.Medium : Severity.Pass,
+                $"Non-Microsoft SYSTEM tasks: {systemTaskCount}. Suspicious path tasks: {suspiciousCount}.",
+                suspiciousCount > 0
+                    ? "Investigate suspicious tasks immediately via Task Scheduler (taskschd.msc)."
+                    : systemTaskCount > 5
+                    ? "Review non-Microsoft SYSTEM tasks in Task Scheduler to verify each is authorized."
+                    : "Scheduled task posture looks clean. Re-audit after any software installation."
+            );
+        }
+        catch (Exception ex)
+        {
+            yield return new Finding(
+                "Scheduled Tasks",
+                "Task Enumeration",
+                "Unable to enumerate scheduled tasks.",
+                Severity.Info,
+                ex.Message,
+                "Manually review scheduled tasks via: taskschd.msc"
+            );
+        }
+    }
+
+    private static IEnumerable<Finding> AuditAutoRunRegistry()
+    {
+        // Check common autorun registry keys for unexpected entries
+        var autorunKeys = new[]
+        {
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+            @"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"
+        };
+
+        var suspiciousEntries = new List<string>();
+
+        foreach (var keyPath in autorunKeys)
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(keyPath);
+                if (key == null) continue;
+
+                foreach (string valueName in key.GetValueNames())
+                {
+                    string? value = key.GetValue(valueName)?.ToString() ?? "";
+
+                    bool suspicious =
+                        value.Contains("\\Temp\\", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("\\AppData\\Local\\Temp", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("powershell -e", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("cmd.exe /c", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("mshta", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("wscript", StringComparison.OrdinalIgnoreCase) ||
+                        value.Contains("cscript", StringComparison.OrdinalIgnoreCase);
+
+                    if (suspicious)
+                        suspiciousEntries.Add($"[{keyPath}] {valueName} = {value}");
+                }
+            }
+            catch { /* Registry access denied — skip */ }
+        }
+
+        yield return new Finding(
+            "Persistence",
+            "Autorun Registry Entries",
+            $"{(suspiciousEntries.Count > 0 ? $"{suspiciousEntries.Count} suspicious" : "No suspicious")} autorun registry entry(ies) detected.",
+            suspiciousEntries.Count > 0 ? Severity.High : Severity.Pass,
+            suspiciousEntries.Count > 0
+                ? string.Join("\n", suspiciousEntries)
+                : "No suspicious autorun entries found in HKLM Run keys.",
+            suspiciousEntries.Count > 0
+                ? "Open regedit.exe and navigate to each flagged key. Remove unauthorized entries. Investigate the referenced executable immediately — could indicate malware persistence."
+                : "Continue periodic review of autorun keys, especially after user-reported anomalies."
+        );
+    }
+
+    private static string[] ParseCsvLine(string line)
+    {
+        var result = new List<string>();
+        bool inQuotes = false;
+        var current = new System.Text.StringBuilder();
+
+        for (int i = 0; i < line.Length; i++)
+        {
+            char c = line[i];
+            if (c == '"')
+            {
+                if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                {
+                    current.Append('"');
+                    i++;
+                }
+                else
+                {
+                    inQuotes = !inQuotes;
+                }
+            }
+            else if (c == ',' && !inQuotes)
+            {
+                result.Add(current.ToString().Trim());
+                current.Clear();
+            }
+            else
+            {
+                current.Append(c);
+            }
+        }
+        result.Add(current.ToString().Trim());
+        return result.ToArray();
+    }
+}
+
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+
+namespace WinSecAudit;
+
+public static class NetworkAuditor
+{
+    // Ports that are high-risk when exposed externally or unnecessarily
+    private static readonly Dictionary<int, (string Name, string Risk, string Remediation)> RiskyPorts = new()
+    {
+        [21]   = ("FTP",             "Cleartext file transfer — credentials and data sent unencrypted.",
+                  "Disable FTP service. Use SFTP (port 22) or FTPS instead. Services → FileZilla Server or IIS FTP → Stop & Disable."),
+        [23]   = ("Telnet",          "Cleartext remote shell — full session including credentials is unencrypted.",
+                  "Disable Telnet immediately. Use SSH (port 22). Remove Windows Telnet feature via: Add/Remove Windows Features."),
+        [25]   = ("SMTP",            "Open SMTP relay can be abused for spam or phishing if misconfigured.",
+                  "Restrict SMTP relay to authorized hosts only. Verify this is an intentional mail server."),
+        [80]   = ("HTTP",            "Unencrypted web traffic. May expose sensitive data or admin interfaces.",
+                  "Redirect all HTTP to HTTPS. Disable port 80 if no web server is needed."),
+        [135]  = ("RPC Endpoint Mapper", "Used by DCOM/WMI — attack surface for lateral movement (EternalBlue chain).",
+                  "Restrict via Windows Firewall to trusted subnets only. Block inbound 135 from untrusted networks."),
+        [137]  = ("NetBIOS Name Service", "Legacy protocol — information disclosure risk, used in NTLM relay attacks.",
+                  "Disable NetBIOS over TCP/IP: Network adapter → Properties → IPv4 → Advanced → WINS → Disable NetBIOS."),
+        [139]  = ("NetBIOS Session",  "SMBv1 legacy path — EternalBlue vulnerable if SMBv1 is enabled.",
+                  "Disable SMBv1: Set-SmbServerConfiguration -EnableSMB1Protocol $false. Block 139 at the firewall."),
+        [445]  = ("SMB",             "Primary SMB port — critical attack surface. EternalBlue, ransomware pivot point.",
+                  "Block inbound 445 at the perimeter firewall immediately. Disable SMBv1 if still active."),
+        [1433] = ("MSSQL",           "SQL Server exposed — risk of direct database attack or credential brute force.",
+                  "Restrict SQL Server to localhost or application subnet. Do not expose to internet."),
+        [3306] = ("MySQL",           "MySQL exposed — same risk as MSSQL.",
+                  "Restrict MySQL to localhost. Use application-layer access only."),
+        [3389] = ("RDP",             "Remote Desktop — high-value target for brute force and BlueKeep exploits.",
+                  "Restrict RDP via firewall to specific admin IPs only. Enable NLA. Consider VPN-gating RDP entirely."),
+        [5985] = ("WinRM HTTP",      "Windows Remote Management over HTTP — no transport encryption.",
+                  "Disable WinRM HTTP. Use WinRM HTTPS (5986) with a valid certificate."),
+        [5986] = ("WinRM HTTPS",     "Windows Remote Management over HTTPS — verify access is restricted.",
+                  "Restrict WinRM access via firewall rules to authorized management hosts only."),
+        [8080] = ("HTTP Alternate",  "Common dev/proxy HTTP port — may expose internal apps without TLS.",
+                  "Review what is listening on 8080. Force HTTPS if exposing a web service."),
+        [8443] = ("HTTPS Alternate", "Alternate HTTPS port — verify certificate and access controls.",
+                  "Ensure valid TLS certificate and restrict access to authorized clients.")
+    };
+
+    public static List<Finding> Audit()
+    {
+        var findings = new List<Finding>();
+
+        try
+        {
+            var ipProps = IPGlobalProperties.GetIPGlobalProperties();
+
+            // TCP listeners
+            var tcpListeners = ipProps.GetActiveTcpListeners();
+            var tcpConnections = ipProps.GetActiveTcpConnections();
+
+            var listeningPorts = tcpListeners
+                .Select(ep => ep.Port)
+                .Distinct()
+                .OrderBy(p => p)
+                .ToList();
+
+            // Check each listening port against risky port list
+            var riskyFound = new List<(int Port, IPEndPoint Endpoint)>();
+
+            foreach (var ep in tcpListeners)
+            {
+                if (RiskyPorts.ContainsKey(ep.Port))
+                    riskyFound.Add((ep.Port, ep));
+            }
+
+            // Deduplicate by port
+            var riskyByPort = riskyFound
+                .GroupBy(r => r.Port)
+                .Select(g => g.First())
+                .ToList();
+
+            foreach (var (port, ep) in riskyByPort)
+            {
+                var (name, risk, remediation) = RiskyPorts[port];
+
+                bool isCritical = port is 23 or 445 or 3389 or 139;
+                bool isHigh     = port is 21 or 135 or 137 or 5985 or 1433 or 3306;
+
+                Severity sev = isCritical ? Severity.Critical
+                             : isHigh     ? Severity.High
+                             : Severity.Medium;
+
+                string bindAddr = ep.Address.Equals(IPAddress.Any) || ep.Address.Equals(IPAddress.IPv6Any)
+                    ? "0.0.0.0 (all interfaces)"
+                    : ep.Address.ToString();
+
+                findings.Add(new Finding(
+                    "Network Exposure",
+                    $"Open Port: {port}/{name}",
+                    $"Port {port} ({name}) is actively listening on {bindAddr}.",
+                    sev,
+                    $"Binding: {bindAddr}:{port}. Risk: {risk}",
+                    remediation
+                ));
+            }
+
+            // SMBv1 check via registry (best effort)
+            findings.AddRange(AuditSmbVersion());
+
+            // Firewall state check
+            findings.AddRange(AuditFirewallState());
+
+            // Summary of all open ports (info-level)
+            if (listeningPorts.Count > 0)
+            {
+                findings.Add(new Finding(
+                    "Network Exposure",
+                    "All Listening TCP Ports",
+                    $"{listeningPorts.Count} TCP port(s) actively listening on this host.",
+                    Severity.Info,
+                    $"Ports: {string.Join(", ", listeningPorts)}",
+                    "Review all listening ports. Any port not required for a documented business function should be disabled."
+                ));
+            }
+        }
+        catch (Exception ex)
+        {
+            findings.Add(new Finding(
+                "Network Exposure",
+                "Enumeration Error",
+                "Failed to enumerate network listeners.",
+                Severity.Info,
+                ex.Message,
+                "Re-run with Administrator privileges for complete network audit."
+            ));
+        }
+
+        return findings;
+    }
+
+    private static IEnumerable<Finding> AuditSmbVersion()
+    {
+        // SMBv1 is notoriously dangerous (EternalBlue/WannaCry)
+        // Check via registry key — requires read access to HKLM
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", writable: false);
+
+            if (key != null)
+            {
+                object? smb1Val = key.GetValue("SMB1");
+                bool smb1Enabled = smb1Val == null || (smb1Val is int i && i != 0);
+
+                yield return new Finding(
+                    "Network Exposure",
+                    "SMBv1 Protocol Status",
+                    smb1Enabled
+                        ? "SMBv1 is enabled — this system is vulnerable to EternalBlue-class exploits."
+                        : "SMBv1 is disabled.",
+                    smb1Enabled ? Severity.Critical : Severity.Pass,
+                    smb1Enabled
+                        ? "SMBv1 was exploited by WannaCry and NotPetya. No modern system requires it."
+                        : "SMBv1 correctly disabled.",
+                    smb1Enabled
+                        ? "Disable SMBv1 immediately: Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force\nOr via registry: HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters → SMB1 = 0"
+                        : "Compliant."
+                );
+            }
+        }
+        catch
+        {
+            yield return new Finding(
+                "Network Exposure",
+                "SMBv1 Protocol Status",
+                "Unable to read SMBv1 registry key — elevation may be required.",
+                Severity.Info,
+                "Registry access denied.",
+                "Re-run as Administrator to check SMBv1 status."
+            );
+        }
+    }
+
+    private static IEnumerable<Finding> AuditFirewallState()
+    {
+        // Query Windows Firewall state via netsh output parsing
+        // This avoids COM/WMI dependency while still being accurate
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = "advfirewall show allprofiles state",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) yield break;
+
+            string output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+
+            var profiles = new[] { "Domain", "Private", "Public" };
+            foreach (var profile in profiles)
+            {
+                // Find the state for each profile section
+                bool profileMentioned = output.Contains(profile + " Profile Settings");
+                bool isOff = false;
+
+                if (profileMentioned)
+                {
+                    int idx = output.IndexOf(profile + " Profile Settings");
+                    string section = output.Substring(idx, Math.Min(300, output.Length - idx));
+                    isOff = section.Contains("State                                 OFF");
+                }
+
+                if (profileMentioned)
+                {
+                    yield return new Finding(
+                        "Firewall",
+                        $"Windows Firewall: {profile} Profile",
+                        isOff
+                            ? $"Windows Firewall is DISABLED for the {profile} profile."
+                            : $"Windows Firewall is enabled for the {profile} profile.",
+                        isOff ? Severity.High : Severity.Pass,
+                        isOff
+                            ? $"Firewall disabled on {profile} profile — no host-based traffic filtering active."
+                            : $"{profile} profile firewall active.",
+                        isOff
+                            ? $"Re-enable firewall: netsh advfirewall set {profile.ToLower()}profile state on\nOr: Windows Security → Firewall & network protection → {profile} network → Turn on."
+                            : "Compliant."
+                    );
+                }
+            }
+        }
+        catch
+        {
+            yield return new Finding(
+                "Firewall",
+                "Firewall State Check",
+                "Unable to query Windows Firewall state.",
+                Severity.Info,
+                "netsh execution failed.",
+                "Manually verify firewall state: Windows Security → Firewall & network protection."
+            );
+        }
+    }
+}
