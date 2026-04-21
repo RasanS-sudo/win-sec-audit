@@ -109,7 +109,7 @@ WinSecAudit.exe --console-only --verbose
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/win-sec-audit.git
+git clone https://github.com/RasanS-sudo/win-sec-audit.git
 cd win-sec-audit/WinSecAudit
 
 # Run directly
