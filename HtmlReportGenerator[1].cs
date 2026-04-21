@@ -519,7 +519,7 @@ public static class HtmlReportGenerator
 
         sb.AppendLine($"""
   <div class="footer">
-    <span>WinSecAudit v1.0 — github.com/YOUR_USERNAME/win-sec-audit</span>
+    <span>WinSecAudit v1.0 — github.com/RasanS-sudo/win-sec-audit</span>
     <span>Report generated {result.Timestamp:yyyy-MM-dd HH:mm:ss} UTC</span>
   </div>
 
